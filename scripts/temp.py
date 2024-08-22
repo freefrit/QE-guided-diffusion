@@ -116,7 +116,6 @@ class CodecOperator():
 class ConditioningMethod():
     def __init__(self, **kwargs):
         self.operator = CodecOperator()
-        # self.noiser = noiser
         self.scale = kwargs.get('scale', 1.0)
     
     def project(self, data, noisy_measurement, **kwargs):
@@ -149,25 +148,21 @@ def p_sample_loop(model,
         out = diffusion.p_sample(model=model, x=img, t=time)
         mean_var = diffusion.p_mean_variance(model=model, x=img, t=time)
 
-        noisy_measurement = diffusion.q_sample(measurement, t=time)
-        img, distance = measurement_cond_fn(x_t=out['sample'],
-                                            measurement=measurement,
-                                            noisy_measurement=noisy_measurement,
-                                            x_prev=img,
-                                            idx=i,
+        # noisy_measurement = diffusion.q_sample(measurement, t=time)
+        img, distance = measurement_cond_fn(x_prev=img,
+                                            x_t=out['sample'],
+                                            x_t_mean=mean_var['mean'],
                                             x_0_hat=out['pred_xstart'],
-                                            sigma_t=torch.exp(0.5 * mean_var['log_variance']),
-                                            x_t_mean=mean_var['mean'])
+                                            measurement=measurement,
+                                            idx=i,
+                                            # noisy_measurement=noisy_measurement,
+                                            # sigma_t=torch.exp(0.5 * mean_var['log_variance']),
+                                            )
         img = img.detach_()
 
         if (i-1) % (step//10) == 0:
             for idx in range(img.shape[0]):
                 torchvision.utils.save_image(unorm(img[idx]), f'{root}/from_{step}/x_{i-1:03d}_{idx}.png')
-        # pbar.set_postfix({'distance': distance.item()}, refresh=False)
-        # if record:
-        #     if idx % 10 == 0:
-        #         file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
-        #         plt.imsave(file_path, clear_color(img))
 
     return img, distance
         
@@ -214,7 +209,6 @@ def main():
         transforms.Resize(256),
         transforms.CenterCrop(256),
         transforms.ToTensor(),
-        # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
     jpeg_transform = transforms.Compose([
         transforms.Lambda(lambda image : jpeg_compression(image, qf=10)),
@@ -258,7 +252,7 @@ def main():
     # x_hat = x
     loss = torch.nn.MSELoss()
     mse = loss(x, x_hat)+1e-10
-    nc = x - x_hat
+    # nc = x - x_hat
     # print(f'nc.max(): {nc.max().item()}')
     logger.log(f'mse: {mse.item()}')
     plotx, ploty, ploty2 = [], [], []
@@ -298,6 +292,7 @@ def main():
     plt.plot(plotx, ploty, 'r-o')
     # plt.plot(plotx, ploty2, 'b-o')
     # plt.legend(['N2N ratio', 'Max2N ratio'])
+    plt.grid()
     plt.show()
     plt.savefig(f'{root}/ratio_plot.png')
 
