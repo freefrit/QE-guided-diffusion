@@ -21,6 +21,7 @@ from guided_diffusion.script_util import (
     add_dict_to_argparser,
     args_to_dict,
 )
+from datetime import date
 
 
 def main():
@@ -102,7 +103,10 @@ def main():
     label_arr = label_arr[: args.num_samples]
     if dist.get_rank() == 0:
         shape_str = "x".join([str(x) for x in arr.shape])
-        out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
+        # out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
+        today = date.today()
+        exp = f'{today.strftime("%y%m%d%H%M")}_samples_{shape_str}.npz'
+        out_path = os.path.join("/work/240805_QE", exp)
         logger.log(f"saving to {out_path}")
         np.savez(out_path, arr, label_arr)
 
