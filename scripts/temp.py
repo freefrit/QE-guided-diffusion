@@ -101,6 +101,15 @@ class UnNormalize(object):
 
 #     else:
 #         return x_t, torch.zeros(1)
+class ste_round(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return torch.round(x)
+
+    @staticmethod
+    def backward(ctx, x_hat_grad):
+        return x_hat_grad.clone()
+
 class CodecOperator():
     def __init__(self, q=4):
         self.codec = compressai.zoo.mbt2018_mean(quality=q, metric='mse', pretrained=True, progress=True).cuda().eval()
@@ -109,8 +118,14 @@ class CodecOperator():
         return data + measurement - self.forward(data) 
     
     def forward(self, data, **kwargs):
-        out = self.codec.g_a((data + 1.0) / 2.0)
-        return (out * 2.0) - 1.0
+        y = self.codec.g_a((data + 1.0) / 2.0)
+        y_hat = ste_round.apply(y)
+        # z = self.codec.h_a(y)
+        # z_hat, z_likelihoods = self.codec.entropy_bottleneck(z)
+        # gaussian_params = self.codec.h_s(z_hat)
+        # scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        # y_hat, y_likelihoods = self.codec.gaussian_conditional(y, scales_hat, means=means_hat)
+        return (y_hat * 2.0) - 1.0
 
 #PosteriorSampling
 class ConditioningMethod():
@@ -124,7 +139,8 @@ class ConditioningMethod():
     def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
         difference = measurement - self.operator.forward(x_0_hat, **kwargs)
         norm = torch.linalg.norm(difference)
-        norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]             
+        norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]  
+        # print(norm_grad)           
         return norm_grad, norm
 
     def conditioning(self, x_prev, x_t, x_t_mean, x_0_hat, measurement, idx, **kwargs):
