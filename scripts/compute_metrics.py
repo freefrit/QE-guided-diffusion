@@ -84,7 +84,7 @@ def compare_images(folder, target, psnrs=None, ssims=None, lpipss=None):
     else:
         print("No matching images found to compare.")
 
-root = '/work/240805_QE/2408201937_kodim04_uncompress_idem1'
+root = '/work/240805_QE/2408230357_kodim04'
 folder = f'{root}/from_'
 target = f'{root}/x.png'
 plotx, psnrs, ssims, lpipss = [], [], [], []
@@ -134,10 +134,12 @@ plt.subplot(3, 1, 1)
 plt.xlabel('time step')
 plt.ylabel('PSNR↑')
 plt.plot(plotx, psnrs, 'r-o')
+plt.grid()
 plt.subplot(3, 1, 2)
 plt.xlabel('time step')
 plt.ylabel('SSIM↑')
 plt.plot(plotx, ssims, 'b-o')
+plt.grid()
 plt.subplot(3, 1, 3)
 plt.xlabel('time step')
 plt.ylabel('LPIPS↓')
