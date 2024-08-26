@@ -34,9 +34,14 @@ import random
 from io import BytesIO
 
 today = datetime.now()
-img_name = 'kodim04'
+img_name = 'kodim20'
+# img_path = f'/dataset/kodak/{img_name}.png'
+img_name = 'img_016'
+img_path = '/work/240805_QE/240806_samples_20x256x256x3/img_016.png'
 root = f'/work/240805_QE/{today.strftime("%y%m%d%H%M")}_{img_name}'
 if not os.path.exists(root): os.mkdir(root)
+cond_scale = 1
+codec_q = 1
 
 def show_model_size(net):
     print("========= Model Size =========")
@@ -111,7 +116,7 @@ class ste_round(torch.autograd.Function):
         return x_hat_grad.clone()
 
 class CodecOperator():
-    def __init__(self, q=4):
+    def __init__(self, q=1):
         self.codec = compressai.zoo.mbt2018_mean(quality=q, metric='mse', pretrained=True, progress=True).cuda().eval()
     
     def project(self, data, measurement, **kwargs):
@@ -219,7 +224,7 @@ def main():
     # show_model_size(model)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    codec = compressai.zoo.mbt2018_mean(quality=4, metric='mse', pretrained=True, progress=True).to(device).eval()
+    codec = compressai.zoo.mbt2018_mean(quality=codec_q, metric='mse', pretrained=True, progress=True).to(device).eval()
     # show_model_size(codec)
     transform = transforms.Compose([
         transforms.Resize(256),
@@ -227,9 +232,9 @@ def main():
         transforms.ToTensor(),
     ])
     jpeg_transform = transforms.Compose([
-        transforms.Lambda(lambda image : jpeg_compression(image, qf=10)),
         transforms.Resize(256),
         transforms.CenterCrop(256),
+        transforms.Lambda(lambda image : jpeg_compression(image, qf=10)),
         transforms.ToTensor(),
     ])
     norm = transforms.Compose([
@@ -237,7 +242,7 @@ def main():
     ])
     unorm = UnNormalize()
 
-    img = Image.open(f'/dataset/kodak/{img_name}.png').convert("RGB")
+    img = Image.open(img_path).convert("RGB")
     x = transform(img).unsqueeze(0).to(device)
     x_jpeg = jpeg_transform(img).unsqueeze(0).to(device)
     # print(f'{x[0].max().item()}, {x[0].min().item()}')
@@ -319,9 +324,9 @@ def main():
         x_hat_t = diffusion.q_sample(x_hat, t)
         img = torch.cat((x_hat_t, x_hat_t, x_hat_t, x_hat_t), 0)
 
-        cond_method = ConditioningMethod(scale = 1.0)
+        cond_method = ConditioningMethod(scale = cond_scale)
         measurement_cond_fn = cond_method.conditioning
-        operator = CodecOperator()
+        operator = CodecOperator(q=codec_q)
         measurement = operator.forward(x)
         measurements = torch.cat((measurement, measurement, measurement, measurement), 0)
         sample, dis = p_sample_loop(model, diffusion, img, step, measurements, measurement_cond_fn)
