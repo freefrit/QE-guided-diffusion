@@ -34,10 +34,10 @@ import random
 from io import BytesIO
 
 today = datetime.now()
-img_name = 'kodim20'
-# img_path = f'/dataset/kodak/{img_name}.png'
-img_name = 'img_016'
-img_path = '/work/240805_QE/240806_samples_20x256x256x3/img_016.png'
+img_name = 'kodim11'
+img_path = f'/dataset/kodak/{img_name}.png'
+# img_name = 'img_016'
+# img_path = '/work/240805_QE/240806_samples_20x256x256x3/img_016.png'
 root = f'/work/240805_QE/{today.strftime("%y%m%d%H%M")}_{img_name}'
 if not os.path.exists(root): os.mkdir(root)
 cond_scale = 1
