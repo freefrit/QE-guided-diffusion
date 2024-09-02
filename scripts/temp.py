@@ -34,7 +34,7 @@ import random
 from io import BytesIO
 
 today = datetime.now()
-img_name = 'kodim11'
+img_name = 'kodim04'
 img_path = f'/dataset/kodak/{img_name}.png'
 # img_name = 'img_016'
 # img_path = '/work/240805_QE/240806_samples_20x256x256x3/img_016.png'
@@ -42,6 +42,8 @@ root = f'/work/240805_QE/{today.strftime("%y%m%d%H%M")}_{img_name}'
 if not os.path.exists(root): os.mkdir(root)
 cond_scale = 1
 codec_q = 1
+codec_metric = 'mse'
+x_constraint = True
 
 def show_model_size(net):
     print("========= Model Size =========")
@@ -81,31 +83,6 @@ class UnNormalize(object):
             # The normalize code -> t.sub_(m).div_(s)
         return temp
 
-# def idempotence(codec, x_prev, x_t, x_t_mean, x_0_pred, x_0, t):
-#     unorm = UnNormalize()
-#     eps = 1e-8
-#     interval = 1
-#     if t % interval == 0:
-#         difference = codec.g_a(unorm(x_0)) - codec.g_a(unorm(x_0_pred))
-#         norm = torch.linalg.norm(difference)
-#         grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
-#         print(f'grad: {grad}')
-#         grad_norm = torch.linalg.norm(grad)
-
-#         b, c, h, w = x_t.shape
-#         r = torch.sqrt(torch.tensor(c * h * w)) * 1.
-#         guidance_rate = 0.1
-
-#         d_star = -r * grad / (grad_norm + eps)
-#         d_sample = x_t - x_t_mean
-#         mix_direction = d_sample + guidance_rate * (d_star - d_sample)
-#         mix_direction_norm = torch.linalg.norm(mix_direction)
-#         mix_step = mix_direction / (mix_direction_norm + eps) * r
-
-#         return x_t_mean + mix_step, norm
-
-#     else:
-#         return x_t, torch.zeros(1)
 class ste_round(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -116,26 +93,31 @@ class ste_round(torch.autograd.Function):
         return x_hat_grad.clone()
 
 class CodecOperator():
-    def __init__(self, q=1):
-        self.codec = compressai.zoo.mbt2018_mean(quality=q, metric='mse', pretrained=True, progress=True).cuda().eval()
+    def __init__(self, q=1, x_constraint=False):
+        self.codec = compressai.zoo.mbt2018_mean(quality=q, metric=codec_metric, pretrained=True, progress=True).cuda().eval()
+        self.x_constraint = x_constraint
     
     def project(self, data, measurement, **kwargs):
         return data + measurement - self.forward(data) 
     
     def forward(self, data, **kwargs):
         y = self.codec.g_a((data + 1.0) / 2.0)
-        y_hat = ste_round.apply(y)
-        # z = self.codec.h_a(y)
-        # z_hat, z_likelihoods = self.codec.entropy_bottleneck(z)
-        # gaussian_params = self.codec.h_s(z_hat)
-        # scales_hat, means_hat = gaussian_params.chunk(2, 1)
-        # y_hat, y_likelihoods = self.codec.gaussian_conditional(y, scales_hat, means=means_hat)
+        if self.x_constraint:
+            z = self.codec.h_a(y)
+            z_hat, _ = self.codec.entropy_bottleneck(z)
+            gaussian_params = self.codec.h_s(z_hat)
+            _, means_hat = gaussian_params.chunk(2, 1)
+            y_hat = ste_round.apply(y - means_hat)
+            x_hat = self.codec.g_s(y_hat + means_hat)
+            return (x_hat * 2.0) - 1.0
+        
+        y_hat = ste_round.apply(y)    
         return (y_hat * 2.0) - 1.0
 
 #PosteriorSampling
 class ConditioningMethod():
     def __init__(self, **kwargs):
-        self.operator = CodecOperator()
+        self.operator = kwargs.get('operator', CodecOperator())
         self.scale = kwargs.get('scale', 1.0)
     
     def project(self, data, noisy_measurement, **kwargs):
@@ -143,13 +125,23 @@ class ConditioningMethod():
     
     def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
         difference = measurement - self.operator.forward(x_0_hat, **kwargs)
+        # print(f'difference shape: {difference.shape}')
         norm = torch.linalg.norm(difference)
+        # print(f'norm shape: {norm.shape}')
         norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]  
         # print(norm_grad)           
         return norm_grad, norm
 
-    def conditioning(self, x_prev, x_t, x_t_mean, x_0_hat, measurement, idx, **kwargs):
-        norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, **kwargs)
+    def conditioning(self, x_prev, x_t, x_t_mean, x_0_hat, measurement, idx, total_step, **kwargs):
+        # norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, **kwargs)
+        difference = measurement - self.operator.forward(x_0_hat, **kwargs)
+        # B, _, _, _ = difference.shape
+        norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
+        # for i in range(B):
+            # print(norm_grad[0].shape)
+            # x_t[i] -= norm_grad[i] * self.scale
+        norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
+        # if idx > (0.5*total_step):
         x_t -= norm_grad * self.scale
         return x_t, norm
     
@@ -176,6 +168,7 @@ def p_sample_loop(model,
                                             x_0_hat=out['pred_xstart'],
                                             measurement=measurement,
                                             idx=i,
+                                            total_step=step
                                             # noisy_measurement=noisy_measurement,
                                             # sigma_t=torch.exp(0.5 * mean_var['log_variance']),
                                             )
@@ -224,7 +217,7 @@ def main():
     # show_model_size(model)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    codec = compressai.zoo.mbt2018_mean(quality=codec_q, metric='mse', pretrained=True, progress=True).to(device).eval()
+    codec = compressai.zoo.mbt2018_mean(quality=codec_q, metric=codec_metric, pretrained=True, progress=True).to(device).eval()
     # show_model_size(codec)
     transform = transforms.Compose([
         transforms.Resize(256),
@@ -324,9 +317,9 @@ def main():
         x_hat_t = diffusion.q_sample(x_hat, t)
         img = torch.cat((x_hat_t, x_hat_t, x_hat_t, x_hat_t), 0)
 
-        cond_method = ConditioningMethod(scale = cond_scale)
+        operator = CodecOperator(q=codec_q, x_constraint=x_constraint)
+        cond_method = ConditioningMethod(scale=cond_scale, operator=operator)
         measurement_cond_fn = cond_method.conditioning
-        operator = CodecOperator(q=codec_q)
         measurement = operator.forward(x)
         measurements = torch.cat((measurement, measurement, measurement, measurement), 0)
         sample, dis = p_sample_loop(model, diffusion, img, step, measurements, measurement_cond_fn)
