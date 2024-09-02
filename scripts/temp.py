@@ -43,7 +43,7 @@ if not os.path.exists(root): os.mkdir(root)
 cond_scale = 1
 codec_q = 1
 codec_metric = 'mse'
-x_constraint = True
+x_constraint = False
 
 def show_model_size(net):
     print("========= Model Size =========")
@@ -93,7 +93,7 @@ class ste_round(torch.autograd.Function):
         return x_hat_grad.clone()
 
 class CodecOperator():
-    def __init__(self, q=1, x_constraint=False):
+    def __init__(self, q, x_constraint=False):
         self.codec = compressai.zoo.mbt2018_mean(quality=q, metric=codec_metric, pretrained=True, progress=True).cuda().eval()
         self.x_constraint = x_constraint
     
@@ -117,7 +117,7 @@ class CodecOperator():
 #PosteriorSampling
 class ConditioningMethod():
     def __init__(self, **kwargs):
-        self.operator = kwargs.get('operator', CodecOperator())
+        self.operator = kwargs.get('operator')
         self.scale = kwargs.get('scale', 1.0)
     
     def project(self, data, noisy_measurement, **kwargs):
@@ -125,22 +125,23 @@ class ConditioningMethod():
     
     def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
         difference = measurement - self.operator.forward(x_0_hat, **kwargs)
-        # print(f'difference shape: {difference.shape}')
-        norm = torch.linalg.norm(difference)
-        # print(f'norm shape: {norm.shape}')
-        norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]  
+        # norm = torch.linalg.norm(difference)
+        norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
+        # norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
+        norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
         # print(norm_grad)           
         return norm_grad, norm
 
     def conditioning(self, x_prev, x_t, x_t_mean, x_0_hat, measurement, idx, total_step, **kwargs):
-        # norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, **kwargs)
-        difference = measurement - self.operator.forward(x_0_hat, **kwargs)
+        norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, **kwargs)
+        # difference = measurement - self.operator.forward(x_0_hat, **kwargs)
+        # norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
+        # norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
         # B, _, _, _ = difference.shape
-        norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
         # for i in range(B):
             # print(norm_grad[0].shape)
             # x_t[i] -= norm_grad[i] * self.scale
-        norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
+        
         # if idx > (0.5*total_step):
         x_t -= norm_grad * self.scale
         return x_t, norm
