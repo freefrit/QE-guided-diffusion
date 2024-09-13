@@ -44,6 +44,8 @@ cond_scale = 1
 codec_q = 1
 codec_metric = 'mse'
 x_constraint = False
+num_sample = 4
+simul = False
 
 def show_model_size(net):
     print("========= Model Size =========")
@@ -128,19 +130,13 @@ class ConditioningMethod():
         # norm = torch.linalg.norm(difference)
         norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
         # norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
-        norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
+        # norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
+        norm_grad = torch.autograd.grad(outputs=torch.sum(norm), inputs=x_prev)[0]
         # print(norm_grad)           
         return norm_grad, norm
 
     def conditioning(self, x_prev, x_t, x_t_mean, x_0_hat, measurement, idx, total_step, **kwargs):
         norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, **kwargs)
-        # difference = measurement - self.operator.forward(x_0_hat, **kwargs)
-        # norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
-        # norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
-        # B, _, _, _ = difference.shape
-        # for i in range(B):
-            # print(norm_grad[0].shape)
-            # x_t[i] -= norm_grad[i] * self.scale
         
         # if idx > (0.5*total_step):
         x_t -= norm_grad * self.scale
@@ -152,10 +148,12 @@ def p_sample_loop(model,
                   step,
                   measurement,
                   measurement_cond_fn,
+                  sample_idx=None,
                   ):
     img = x_start
     device = x_start.device
     unorm = UnNormalize()
+    plotx, ploty = [], []
     for i in tqdm(range(step, 0, -1)):
         time = torch.tensor([i] * img.shape[0], device=device)
         img = img.requires_grad_()
@@ -176,9 +174,23 @@ def p_sample_loop(model,
         img = img.detach_()
 
         if (i-1) % (step//10) == 0:
-            for idx in range(img.shape[0]):
-                torchvision.utils.save_image(unorm(img[idx]), f'{root}/from_{step}/x_{i-1:03d}_{idx}.png')
-
+            plotx.append(i-1)
+            ploty.append(distance.mean().item())
+            if sample_idx:
+                torchvision.utils.save_image(unorm(img[0]), f'{root}/from_{step}/x_{i-1:03d}_{sample_idx}.png')
+            else:
+                for idx in range(img.shape[0]):
+                    torchvision.utils.save_image(unorm(img[idx]), f'{root}/from_{step}/x_{i-1:03d}_{idx}.png')
+    # plt.figure(0)
+    plt.clf()
+    plt.xlabel('time step')
+    plt.ylabel('distance (norm)')
+    plt.plot(plotx, ploty, 'r-o')
+    plt.grid()
+    if sample_idx:
+        plt.savefig(f'{root}/from_{step}/norm_plot_{sample_idx}.png')
+    else:
+        plt.savefig(f'{root}/from_{step}/norm_plot.png')
     return img, distance
         
 
@@ -311,19 +323,33 @@ def main():
     plt.show()
     plt.savefig(f'{root}/ratio_plot.png')
 
+    distances = []
     for step in steps:
         logger.log(f"denoising from step {step}...")
         if not os.path.exists(f'{root}/from_{step}'): os.mkdir(f'{root}/from_{step}')
-        t = torch.tensor([step]).to(device)
-        x_hat_t = diffusion.q_sample(x_hat, t)
-        img = torch.cat((x_hat_t, x_hat_t, x_hat_t, x_hat_t), 0)
+        if not step == 999:
+            t = torch.tensor([step]).to(device)
+            x_hat_t = diffusion.q_sample(x_hat, t)
+        else:
+            x_hat_t = torch.randn_like(x_hat).to(device)
 
         operator = CodecOperator(q=codec_q, x_constraint=x_constraint)
         cond_method = ConditioningMethod(scale=cond_scale, operator=operator)
         measurement_cond_fn = cond_method.conditioning
         measurement = operator.forward(x)
-        measurements = torch.cat((measurement, measurement, measurement, measurement), 0)
-        sample, dis = p_sample_loop(model, diffusion, img, step, measurements, measurement_cond_fn)
+
+        if simul == True:
+            img = torch.stack([x_hat_t for _ in range(num_sample)], dim=0)
+            measurements = torch.stack([measurement for _ in range(num_sample)], dim=0)
+            sample, dis = p_sample_loop(model, diffusion, img, step, measurements, measurement_cond_fn)
+        else:
+            img = x_hat_t
+            measurements = measurement
+            total_dis = 0
+            for sidx in range(num_sample):
+                sample, dis = p_sample_loop(model, diffusion, img, step, measurements, measurement_cond_fn, sample_idx=sidx)
+                total_dis += dis.item()
+            distances.append(total_dis/num_sample)
 
         # for i in tqdm(range(step, 0, -1)):
         #     t = torch.tensor([i] * img.shape[0], device=device)
@@ -347,8 +373,13 @@ def main():
         #         if (i-1) % (step//10) == 0:
         #             for idx in range(img.shape[0]):
         #                 torchvision.utils.save_image(unorm(img[idx]), f'{root}/from_{step}/x_{i-1:03d}_{idx}.png')
-
-
+    # plt.figure(1)
+    # plt.clf()
+    # plt.xlabel('time step')
+    # plt.ylabel('distance (norm)')
+    # plt.plot(steps, distances, 'r-o')
+    # plt.grid()
+    # plt.savefig(f'{root}/last_norm_plot.png')
 
 
 if __name__ == "__main__":
