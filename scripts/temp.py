@@ -34,17 +34,17 @@ import random
 from io import BytesIO
 
 today = datetime.now()
-img_name = 'kodim04'
-img_path = f'/dataset/kodak/{img_name}.png'
-# img_name = 'img_016'
-# img_path = '/work/240805_QE/240806_samples_20x256x256x3/img_016.png'
+# img_name = 'kodim04'
+# img_path = f'/dataset/kodak/{img_name}.png'
+img_name = 'img_016'
+img_path = '/work/240805_QE/240806_samples_20x256x256x3/img_016.png'
 root = f'/work/240805_QE/{today.strftime("%y%m%d%H%M")}_{img_name}'
 if not os.path.exists(root): os.mkdir(root)
-cond_scale = 1
+cond_scale = 1.0
 codec_q = 1
 codec_metric = 'mse'
 x_constraint = False
-num_sample = 4
+num_sample = 1
 simul = False
 
 def show_model_size(net):
@@ -142,6 +142,45 @@ class ConditioningMethod():
         x_t -= norm_grad * self.scale
         return x_t, norm
     
+class ConditioningMethod2():
+    # method for regularization on x0
+    def __init__(self, **kwargs):
+        self.operator = kwargs.get('operator')
+        self.scale = kwargs.get('scale', 1.0)
+    
+    def project(self, data, noisy_measurement, **kwargs):
+        return self.operator.project(data=data, measurement=noisy_measurement, **kwargs)
+    
+    def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
+        difference = measurement - self.operator.forward(x_0_hat, **kwargs)
+        # norm = torch.linalg.norm(difference)
+        norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
+        # norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
+        # norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
+        norm_grad = torch.autograd.grad(outputs=torch.sum(norm), inputs=x_0_hat)[0]
+        # print(norm_grad)           
+        return norm_grad, norm
+
+    def conditioning(self, x_prev, x_t, x_t_mean, x_0_hat, measurement, idx, total_step, **kwargs):
+        norm_grad, norm = self.grad_and_value(x_prev=None, x_0_hat=x_0_hat, measurement=measurement, **kwargs)
+        x_0_hat -= norm_grad * self.scale / kwargs.get('diffusion').sqrt_alphas_cumprod[idx]
+        # x_0_hat -= norm_grad * self.scale
+        # if idx > (0.5*total_step):
+        # x_t -= norm_grad * self.scale
+
+        # sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        noise = th.randn_like(x_0_hat)
+        t = torch.tensor([idx] * x_0_hat.shape[0], device=x_0_hat.device)
+        nonzero_mask = (
+            (t != 0).float().view(-1, *([1] * (len(x_0_hat.shape) - 1)))
+        )  # no noise when t == 0
+        model_mean, _, _ = kwargs.get('diffusion').q_posterior_mean_variance(
+            x_start=x_0_hat, x_t=x_prev, t=t
+        )
+        update_x_t = model_mean + nonzero_mask * th.exp(0.5 * kwargs.get('x_t_log_var')) * noise
+
+        return update_x_t, norm
+    
 def p_sample_loop(model,
                   diffusion,
                   x_start,
@@ -167,7 +206,10 @@ def p_sample_loop(model,
                                             x_0_hat=out['pred_xstart'],
                                             measurement=measurement,
                                             idx=i,
-                                            total_step=step
+                                            total_step=step,
+                                            x_t_log_var=mean_var['log_variance'],
+                                            diffusion=diffusion,
+                                            t=time,
                                             # noisy_measurement=noisy_measurement,
                                             # sigma_t=torch.exp(0.5 * mean_var['log_variance']),
                                             )
@@ -334,7 +376,7 @@ def main():
             x_hat_t = torch.randn_like(x_hat).to(device)
 
         operator = CodecOperator(q=codec_q, x_constraint=x_constraint)
-        cond_method = ConditioningMethod(scale=cond_scale, operator=operator)
+        cond_method = ConditioningMethod2(scale=cond_scale, operator=operator)
         measurement_cond_fn = cond_method.conditioning
         measurement = operator.forward(x)
 
