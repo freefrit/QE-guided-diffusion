@@ -40,12 +40,21 @@ img_name = 'img_016'
 img_path = '/work/240805_QE/240806_samples_20x256x256x3/img_016.png'
 root = f'/work/240805_QE/{today.strftime("%y%m%d%H%M")}_{img_name}'
 if not os.path.exists(root): os.mkdir(root)
-cond_scale = 1.0
+cond_scale = 1
 codec_q = 1
 codec_metric = 'mse'
 x_constraint = False
-num_sample = 1
+num_sample = 4
 simul = False
+ga_weight = 10
+logger.configure(dir=root)
+logger.log(f'scale:{cond_scale}, codec_q:{codec_q}, metric:{codec_metric}')
+logger.log(f'x_constraint:{x_constraint}, num_sample:{num_sample}, simul:{simul}')
+ga_feats_gt = []
+steps = []
+steps.extend(range(30, 200, 30))
+steps.extend(range(200, 1000, 100))
+steps.append(999)
 
 def show_model_size(net):
     print("========= Model Size =========")
@@ -67,6 +76,11 @@ def jpeg_compression(image, qf=None):
     outputIoStream.seek(0)
     return Image.open(outputIoStream)
 
+def normalize_tensor(in_feat, eps=1e-10):
+    # norm_factor = torch.sqrt(torch.sum(in_feat**2, dim=1, keepdim=True))
+    norm_factor = torch.linalg.vector_norm(in_feat, dim=1, keepdim=True)
+    return in_feat / (norm_factor + eps)
+
 class UnNormalize(object):
     def __init__(self, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)):
         self.mean = mean
@@ -85,11 +99,15 @@ class UnNormalize(object):
             # The normalize code -> t.sub_(m).div_(s)
         return temp
 
+def get_ga_hook(outputs_list):
+    def ga_hook(module, input, output):
+        outputs_list.append(output)
+    return ga_hook
+
 class ste_round(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         return torch.round(x)
-
     @staticmethod
     def backward(ctx, x_hat_grad):
         return x_hat_grad.clone()
@@ -114,7 +132,7 @@ class CodecOperator():
             return (x_hat * 2.0) - 1.0
         
         y_hat = ste_round.apply(y)    
-        return (y_hat * 2.0) - 1.0
+        return y_hat
 
 #PosteriorSampling
 class ConditioningMethod():
@@ -127,11 +145,11 @@ class ConditioningMethod():
     
     def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
         difference = measurement - self.operator.forward(x_0_hat, **kwargs)
-        # norm = torch.linalg.norm(difference)
-        norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
-        # norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
+        norm = torch.linalg.norm(difference)
+        # norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
+        norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
         # norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
-        norm_grad = torch.autograd.grad(outputs=torch.sum(norm), inputs=x_prev)[0]
+        # norm_grad = torch.autograd.grad(outputs=torch.sum(norm), inputs=x_prev)[0]
         # print(norm_grad)           
         return norm_grad, norm
 
@@ -142,22 +160,18 @@ class ConditioningMethod():
         x_t -= norm_grad * self.scale
         return x_t, norm
     
-class ConditioningMethod2():
-    # method for regularization on x0
+class ConditioningMethod2(ConditioningMethod):
     def __init__(self, **kwargs):
         self.operator = kwargs.get('operator')
         self.scale = kwargs.get('scale', 1.0)
-    
-    def project(self, data, noisy_measurement, **kwargs):
-        return self.operator.project(data=data, measurement=noisy_measurement, **kwargs)
-    
+    # method for regularization on x0
     def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
         difference = measurement - self.operator.forward(x_0_hat, **kwargs)
-        # norm = torch.linalg.norm(difference)
-        norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
-        # norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
+        norm = torch.linalg.norm(difference)
+        # norm = torch.linalg.vector_norm(difference, ord=2, dim=(1, 2, 3))
+        norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
         # norm_grad = torch.autograd.grad(outputs=torch.mean(norm), inputs=x_prev)[0]
-        norm_grad = torch.autograd.grad(outputs=torch.sum(norm), inputs=x_0_hat)[0]
+        # norm_grad = torch.autograd.grad(outputs=torch.sum(norm), inputs=x_0_hat)[0]
         # print(norm_grad)           
         return norm_grad, norm
 
@@ -180,7 +194,69 @@ class ConditioningMethod2():
         update_x_t = model_mean + nonzero_mask * th.exp(0.5 * kwargs.get('x_t_log_var')) * noise
 
         return update_x_t, norm
+
+class CodecConditioning(ConditioningMethod):
+    def __init__(self, **kwargs):
+        self.operator = kwargs.get('operator')
+        self.scale = kwargs.get('scale', 1.0)
+        # self.ga_feats_gt = kwargs.get('ga_feats_gt')
+        self.ga_feats_pred = []
+
+        for layer in self.operator.codec.g_a:
+            if isinstance(layer, torch.nn.Conv2d):
+                layer.register_forward_hook(get_ga_hook(self.ga_feats_pred))
+
+    def get_mean_feats(self, ga_feats):
+        if isinstance(ga_feats, list):
+            feats = torch.cat([torch.mean(feature, dim=(-1, -2)) for feature in ga_feats], dim=1)
+        else:
+            feats = torch.mean(ga_feats, dim=(-1, -2))
+        feats = normalize_tensor(feats)
+        return feats
     
+    def conditioning(self, x_prev, x_t, x_t_mean, x_0_hat, measurement, idx, **kwargs):
+        '''
+        x_prev: input noisy img x_(t+1)
+        x_t: diffusion model predicted step t noisy img
+        x_t_mean: predicted step t mean
+        x_0_hat: predicted clear img
+        measurement: GT condition y for regularization
+        idx: timestep t
+        ga_feats_g: GT conditions of codec's g_a
+        k: # for taking top k values
+        '''
+        self.ga_feats_pred.clear()
+        # norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, **kwargs)
+        difference = measurement - self.operator.forward(x_0_hat, **kwargs)
+        norm = torch.linalg.norm(difference)
+        loss = norm
+
+        # Take topk from all feature channels
+        # feats_gt = self.get_mean_feats(kwargs.get('ga_feats_gt'))
+        # feats_pred = self.get_mean_feats(self.ga_feats_pred)
+
+        # topk_idx = torch.topk(torch.abs(feats_gt - feats_pred) * feats_gt, kwargs.get('k'), dim=1)[1].squeeze()
+        # feats_gt_k = feats_gt[:, topk_idx]
+        # feats_pred_k = feats_pred[:, topk_idx]
+
+        # loss = loss + ga_weight*torch.mean(torch.abs(feats_gt_k - feats_pred_k)**2)
+
+        # Take topk from each conv output feature channels
+        for i in range(len(self.ga_feats_pred)):
+            feats_gt = self.get_mean_feats(kwargs.get('ga_feats_gt')[i])
+            feats_pred = self.get_mean_feats(self.ga_feats_pred[i])
+
+            topk_idx = torch.topk(torch.abs(feats_gt - feats_pred) * feats_gt, kwargs.get('k'), dim=1)[1].squeeze()
+            feats_gt_k = feats_gt[:, topk_idx]
+            feats_pred_k = feats_pred[:, topk_idx]
+
+            loss = loss + ga_weight*torch.mean(torch.abs(feats_gt_k - feats_pred_k)**2)
+        # print(f'basic norm:{norm.item()}, codec norm:{(loss-norm).item()}')
+        ga_grad = torch.autograd.grad(outputs=loss, inputs=x_prev)[0]
+
+        x_t -= ga_grad * self.scale
+        return x_t, norm
+
 def p_sample_loop(model,
                   diffusion,
                   x_start,
@@ -254,7 +330,7 @@ def main():
     args = create_argparser().parse_args()
 
     dist_util.setup_dist()
-    logger.configure(dir=root)
+    # logger.configure(dir=root)
 
     logger.log("creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
@@ -273,7 +349,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     codec = compressai.zoo.mbt2018_mean(quality=codec_q, metric=codec_metric, pretrained=True, progress=True).to(device).eval()
-    # show_model_size(codec)
+
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(256),
@@ -326,23 +402,19 @@ def main():
     logger.log(f'mse: {mse.item()}')
     plotx, ploty, ploty2 = [], [], []
     
-    steps = []
-    steps.extend(range(10, 200, 10))
-    steps.extend(range(200, 1000, 100))
-    steps.append(999)
     logger.log("generating noisy imgs...")
     '''
     _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
     + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
     '''
     for step in steps:
-        logger.log(f'step {step}')
+        # logger.log(f'step {step}')
         # print(f'mean scale {step}: {diffusion.sqrt_alphas_cumprod[step]}')
         # print(f'var scale {step}: {diffusion.sqrt_one_minus_alphas_cumprod[step]}')
         ratio = torch.sqrt(mse)*diffusion.sqrt_alphas_cumprod[step]/diffusion.sqrt_one_minus_alphas_cumprod[step]
         # max_ratio = nc.max().item()*diffusion.sqrt_alphas_cumprod[step]/diffusion.sqrt_one_minus_alphas_cumprod[step]
-        logger.log(f'ratio: {ratio}')
-        logger.log(f'ratio(dB): {10 * math.log((ratio**2).item(), 10)}')
+        # logger.log(f'ratio: {ratio}')
+        # logger.log(f'ratio(dB): {10 * math.log((ratio**2).item(), 10)}')
         # logger.log(f'max_ratio: {max_ratio}')
         plotx.append(step)
         ploty.append(10 * math.log((ratio**2).item(), 10))
@@ -369,14 +441,14 @@ def main():
     for step in steps:
         logger.log(f"denoising from step {step}...")
         if not os.path.exists(f'{root}/from_{step}'): os.mkdir(f'{root}/from_{step}')
-        if not step == 999:
+        if not step == steps[-1]:
             t = torch.tensor([step]).to(device)
             x_hat_t = diffusion.q_sample(x_hat, t)
         else:
             x_hat_t = torch.randn_like(x_hat).to(device)
 
         operator = CodecOperator(q=codec_q, x_constraint=x_constraint)
-        cond_method = ConditioningMethod2(scale=cond_scale, operator=operator)
+        cond_method = ConditioningMethod(scale=cond_scale, operator=operator)
         measurement_cond_fn = cond_method.conditioning
         measurement = operator.forward(x)
 
@@ -388,8 +460,8 @@ def main():
             img = x_hat_t
             measurements = measurement
             total_dis = 0
-            for sidx in range(num_sample):
-                sample, dis = p_sample_loop(model, diffusion, img, step, measurements, measurement_cond_fn, sample_idx=sidx)
+            for sample_idx in range(num_sample):
+                sample, dis = p_sample_loop(model, diffusion, img, step, measurements, measurement_cond_fn, sample_idx=sample_idx)
                 total_dis += dis.item()
             distances.append(total_dis/num_sample)
 
